@@ -1,22 +1,26 @@
 # ocsh — Mini-shell en C
 
-Mini-shell développé en C dans le cadre du Projet 3 du module Systèmes d'Exploitation (UIR/ESIN).
+Mini-shell développé en C dans le cadre du **Projet 3** du module Systèmes d'Exploitation (UIR/ESIN).
 
 ## Description
 
-ocsh est un interpréteur de commandes simplifié qui reproduit les fonctionnalités de base de Bash. Il utilise directement les appels système Linux (`fork`, `execvp`, `wait`, `dup2`, `pipe`) pour créer des processus, gérer les redirections et les pipes.
+ocsh est un interpréteur de commandes simplifié qui reproduit les mécanismes de base de Bash.
+Il utilise directement les appels système Linux (`fork`, `execvp`, `waitpid`, `dup2`, `pipe`, `open`)
+pour créer des processus, gérer les redirections et les pipes, sans jamais passer par `system()`
+ni par `/bin/sh` pour exécuter une commande.
 
 ## Compilation
 
-```bash
-make
-```
-
-Pour nettoyer :
+Prérequis : `gcc` et `make` sur Linux.
 
 ```bash
-make clean
+make          # produit le binaire ./ocsh
+make clean    # supprime le binaire
 ```
+
+Le code se compile en C99 strict (`-std=c99 -Wall -Wextra`) ; la macro `_POSIX_C_SOURCE`
+est définie en tête de `code/ocsh.c` pour exposer les appels POSIX (`sigaction`, `setenv`,
+`strdup`, `glob`, `opendir`…).
 
 ## Utilisation
 
@@ -26,7 +30,8 @@ make clean
 ./ocsh
 ```
 
-Le prompt `ocsh>` apparaît. Tapez vos commandes, utilisez TAB pour la complétion et les flèches haut/bas pour naviguer dans l'historique.
+Le prompt `ocsh>` apparaît. TAB complète les commandes et les noms de fichiers, les flèches
+haut/bas parcourent l'historique, Ctrl+D quitte.
 
 ### Mode script
 
@@ -44,7 +49,7 @@ Le prompt `ocsh>` apparaît. Tapez vos commandes, utilisez TAB pour la compléti
 | `say`    | `echo`          | Afficher du texte |
 | `info`   | `help`          | Afficher l'aide |
 | `past`   | `history`       | Afficher l'historique |
-| `osinfo` | —               | Afficher "Systèmes d'Exploitation -- UIR/ESIN" |
+| `osinfo` | —               | Afficher « Systèmes d'Exploitation -- UIR/ESIN » |
 | `export` | `export`        | Exporter une variable d'environnement |
 
 ## Alias
@@ -61,18 +66,32 @@ Le prompt `ocsh>` apparaît. Tapez vos commandes, utilisez TAB pour la compléti
 
 ## Fonctionnalités
 
-- **Redirections** : `>` (écriture), `>>` (ajout), `<` (lecture)
-- **Pipe** : `->` (au lieu de `|`)
-- **Arrière-plan** : `&` en fin de commande
-- **Variables** : `VAR=valeur`, `$VAR`, `${VAR}`, `$?`, `$!`
-- **Substitution de commandes** : `$(commande)` et `` `commande` ``
-- **Fichier de configuration** : `~/.ocshrc` (exécuté au démarrage)
-- **Historique** : navigation avec flèches haut/bas
-- **Complétion** : TAB pour compléter les commandes et noms de fichiers
-- **Mode script** : support de `if/then/else/fi`, `for/in/do/done`, `while/do/done`
-- **Signaux** : SIGINT (Ctrl+C) ne quitte pas le shell, SIGCHLD nettoie les zombies
+- **Exécution externe** : `fork()` + `execvp()` + `waitpid()` ; code retour 127 si la commande est introuvable.
+- **Redirections** : `>`, `>>`, `<`, `2>`, `2>&1` — avec ou sans espace (`say hello>f.txt` fonctionne).
+- **Pipe** : `->` (au lieu de `|`), nombre d'étages illimité (`a -> b -> c`).
+- **Arrière-plan** : `&` en fin de commande, PID rangé dans `$!`.
+- **Variables** : `VAR=valeur`, `$VAR`, `${VAR}`, `$?`, `$!`, `export`.
+- **Substitution de commandes** : `$(commande)` et `` `commande` ``.
+- **Jokers** : `*`, `?`, `[...]` (un motif sans correspondance reste littéral).
+- **Fichier de configuration** : `~/.ocshrc`, exécuté au démarrage.
+- **Historique** : 100 entrées, navigation par flèches, builtin `past`.
+- **Complétion** : TAB sur les commandes intégrées, les alias et les fichiers du répertoire courant.
+- **Mode script** : `if/then/else/fi`, `for/in/do/done`, `while/do/done`, avec blocs imbriqués.
+- **Signaux** : `SIGINT` n'arrête pas le shell et annule la ligne en cours de frappe ; `SIGCHLD`
+  moissonne les fils d'arrière-plan (pas de zombies).
 
-## Exemples (démonstration soutenance)
+## Limites connues
+
+Ces points ne sont **pas** implémentés ; ils sont volontairement hors du périmètre demandé par le sujet :
+
+- pas de séquencement `;`, ni de `&&` / `||` ;
+- `if/then/fi` n'existe qu'en mode script (la forme sur une seule ligne en interactif n'est pas reconnue) ;
+- pas de contrôle de tâches (`jobs`, `fg`, `bg`) ;
+- pas de heredoc (`<<`), ni de substitution arithmétique `$((...))` ;
+- l'expansion des variables a lieu y compris entre apostrophes (`say '$HOME'` développe `$HOME`) ;
+- les jokers sont développés même s'ils sont entre guillemets.
+
+## Exemples (démonstration de soutenance)
 
 ```bash
 ocsh> list
@@ -89,13 +108,12 @@ ocsh> osinfo
 ## Structure du projet
 
 ```
-ocsh/
+ocsh-mini-shell/
 ├── code/
-│   └── ocsh.c        # Code source principal
-├── Makefile           # Compilation
-├── README.md          # Ce fichier
-├── report.pdf         # Rapport (2-4 pages)
-└── demo.mp4           # Vidéo de démonstration
+│   └── ocsh.c        # code source commenté (C99)
+├── Makefile          # compilation
+├── README.md         # ce fichier
+└── report.md         # rapport (2–4 pages, source du report.pdf)
 ```
 
 ## Auteurs

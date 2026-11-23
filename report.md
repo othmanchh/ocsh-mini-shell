@@ -47,26 +47,30 @@ Le projet mobilise directement les notions vues en TP :
 - **Expansion des variables dans les substitutions** : les variables `$VAR` à l'intérieur de `$(...)` devaient être résolues avant d'exécuter la commande. Nous avons résolu cela en effectuant une expansion récursive.
 - **Gestion du terminal pour la complétion** : pour capturer la touche TAB et les flèches, il faut passer le terminal en mode "raw" avec `termios`, ce qui n'était pas couvert en TP. Nous avons utilisé `tcgetattr` et `tcsetattr` de manière simple.
 - **Parsing du pipe `->` ** : comme `->` contient deux caractères, il fallait le distinguer d'un simple `-` suivi d'un `>` (redirection). Nous parcourons la ligne caractère par caractère.
+- **Course entre `SIGCHLD` et `waitpid()`** : le handler `SIGCHLD` moissonnait tous les fils avec `waitpid(-1, WNOHANG)`, y compris le fils au premier plan que le shell s'apprêtait à attendre. Selon l'ordre d'exécution, ce dernier récupérait `-1` et lisait `$?` dans un statut non initialisé. Nous avons corrigé le problème en bloquant `SIGCHLD` avec `sigprocmask()` autour de `fork()`/`waitpid()` : le handler ne s'exécute plus dans la section critique et ne traite que les fils d'arrière-plan.
+- **Redirection collée au mot** : `say hello>f.txt` n'était pas reconnu, car le découpage se faisait uniquement sur les espaces. Une passe de normalisation insère des espaces autour des opérateurs (`>`, `>>`, `<`, `2>`, `2>&1`) avant le découpage, en respectant les guillemets.
 
 ## 6. Résultats
 
-Toutes les fonctionnalités demandées sont implémentées et testées :
+| Fonctionnalité | État | Remarque |
+|---|---|---|
+| Boucle interactive | ✓ | |
+| Builtins (go, quit, path, say, info, past, osinfo) | ✓ | |
+| Alias (list, show, copy, move, del, newdir, newfile) | ✓ | |
+| Redirections (>, >>, <) | ✓ | avec ou sans espace ; `2>` et `2>&1` également |
+| Pipe (->) | ✓ | pipelines à plusieurs étages |
+| Arrière-plan (&) | ✓ | PID dans `$!`, pas de zombie |
+| Signaux (SIGINT, SIGCHLD) | ✓ | Ctrl+C annule la ligne, ne quitte pas le shell |
+| Variables ($VAR, ${VAR}, $?, $!) | ✓ | |
+| Export | ✓ | |
+| Substitution de commandes ($(...), backticks) | ✓ | |
+| Fichier .ocshrc | ✓ | |
+| Historique et complétion | ✓ | flèches + TAB (commandes et fichiers) |
+| Mode script (if, for, while) | ✓ | blocs imbriqués ; forme sur une seule ligne non supportée en interactif |
+| Jokers (*, ?, [...]) | ✓ | motif sans correspondance laissé littéral |
 
-| Fonctionnalité | État |
-|---|---|
-| Boucle interactive | ✓ |
-| Builtins (go, quit, path, say, info, past, osinfo) | ✓ |
-| Alias (list, show, copy, move, del, newdir, newfile) | ✓ |
-| Redirections (>, >>, <) | ✓ |
-| Pipe (->) | ✓ |
-| Arrière-plan (&) | ✓ |
-| Signaux (SIGINT, SIGCHLD) | ✓ |
-| Variables ($VAR, ${VAR}, $?, $!) | ✓ |
-| Export | ✓ |
-| Substitution de commandes ($(...), backticks) | ✓ |
-| Fichier .ocshrc | ✓ |
-| Historique et complétion | ✓ |
-| Mode script (if, for, while) | ✓ |
+Limites assumées (hors périmètre du sujet) : pas de `;`, `&&`, `||`, ni de contrôle de tâches
+(`jobs`, `fg`, `bg`), pas de heredoc, et les variables sont développées même entre apostrophes.
 
 Les commandes de la soutenance fonctionnent correctement :
 

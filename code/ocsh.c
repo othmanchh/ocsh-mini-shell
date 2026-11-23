@@ -3,6 +3,10 @@
  * Projet 3 — Systèmes d'Exploitation — UIR/ESIN
  */
 
+/* Sans cette macro, la compilation en -std=c99 strict n'expose pas
+   struct sigaction, SA_RESTART, setenv, strdup, popen... (POSIX 2008). */
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +18,8 @@
 #include <errno.h>
 #include <ctype.h>
 #include <termios.h>
+#include <glob.h>
+#include <dirent.h>
 
 #define MAX_LINE 1024
 #define MAX_ARGS 128
@@ -41,16 +47,54 @@ int dernier_pid_bg = 0;  /* $! */
 
 /* ===================== Gestion des signaux ===================== */
 
-/* Eviter les processus zombies */
+/*
+ * Pourquoi SIGCHLD est bloqué autour de fork()/waitpid() :
+ * le handler moissonne TOUS les fils terminés avec waitpid(-1). Sans
+ * masquage, il peut voler le statut d'un fils au premier plan juste
+ * avant que le shell ne l'attende ; waitpid() renvoie alors -1 et le
+ * code retour ($?) serait lu dans une variable non initialisée.
+ * On bloque donc SIGCHLD pendant la section critique : le handler ne
+ * s'exécute qu'après, quand il ne reste que les fils d'arrière-plan.
+ */
+
+void bloquer_sigchld(sigset_t *ancien) {
+    sigset_t masque;
+    sigemptyset(&masque);
+    sigaddset(&masque, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &masque, ancien);
+}
+
+void restaurer_masque(sigset_t *ancien) {
+    sigprocmask(SIG_SETMASK, ancien, NULL);
+}
+
+/* Attend un fils précis en tolérant les interruptions (SIGINT).
+   Renvoie 0 si le statut a été récupéré, -1 si le fils est inconnu. */
+int attendre_fils(pid_t pid, int *statut) {
+    int st;
+
+    for (;;) {
+        if (waitpid(pid, &st, 0) == pid) {
+            if (statut) *statut = st;
+            return 0;
+        }
+        if (errno != EINTR)
+            return -1;  /* ECHILD : déjà moissonné, statut inconnu */
+    }
+}
+
+/* Eviter les processus zombies (fils d'arrière-plan) */
 void handle_sigchld(int sig) {
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0);
 }
 
-/* Ignorer SIGINT dans le shell parent */
+/* Ctrl+C : le shell survit, mais la ligne en cours de frappe est jetée.
+   Pas de SA_RESTART : read()/fgets() renvoient EINTR et la boucle
+   d'affichage repart sur un prompt propre. */
 void handle_sigint(int sig) {
     (void)sig;
-    write(1, "\nocsh> ", 7);
+    write(STDOUT_FILENO, "\n", 1);
 }
 
 void init_signaux(void) {
@@ -64,7 +108,8 @@ void init_signaux(void) {
 
     /* SIGINT : ne pas quitter le shell */
     sa.sa_handler = handle_sigint;
-    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
 }
 
@@ -386,6 +431,98 @@ int executer_builtin(char **args, int argc) {
 
 /* ===================== Gestion des redirections ===================== */
 
+/*
+ * Insère des espaces autour des opérateurs de redirection pour que
+ * `say hello>f.txt` soit analysé comme `say hello > f.txt`.
+ * Les opérateurs entre guillemets sont laissés intacts.
+ * Opérateurs reconnus : > >> < 2> 2>&1
+ */
+void normaliser_redirections(const char *src, char *dest, int taille) {
+    int j = 0;
+    char guillemet = 0;
+
+    for (int i = 0; src[i] != '\0' && j < taille - 5; i++) {
+        char c = src[i];
+
+        if (guillemet) {
+            dest[j++] = c;
+            if (c == guillemet) guillemet = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            guillemet = c;
+            dest[j++] = c;
+            continue;
+        }
+
+        /* 2> et 2>&1 : redirection de stderr */
+        if (c == '2' && src[i + 1] == '>' &&
+            (i == 0 || src[i - 1] == ' ' || src[i - 1] == '\t')) {
+            if (j > 0 && dest[j - 1] != ' ') dest[j++] = ' ';
+            dest[j++] = '2';
+            dest[j++] = '>';
+            i++;
+            if (src[i + 1] == '&' && src[i + 2] == '1') {
+                dest[j++] = '&';
+                dest[j++] = '1';
+                i += 2;
+            }
+            dest[j++] = ' ';
+            continue;
+        }
+
+        if (c == '>' || c == '<') {
+            if (j > 0 && dest[j - 1] != ' ') dest[j++] = ' ';
+            dest[j++] = c;
+            if (c == '>' && src[i + 1] == '>') {
+                dest[j++] = '>';
+                i++;
+            }
+            dest[j++] = ' ';
+            continue;
+        }
+
+        dest[j++] = c;
+    }
+    dest[j] = '\0';
+}
+
+/*
+ * Expansion des jokers (*, ?, [...]) comme le fait bash.
+ * Un motif sans correspondance reste littéral (GLOB_NOCHECK).
+ */
+void expandre_jokers(char **args, int *argc) {
+    static char stockage[MAX_ARGS][MAX_PATH];
+    char *nouveaux[MAX_ARGS];
+    int nb = 0;
+
+    for (int i = 0; i < *argc && nb < MAX_ARGS - 1; i++) {
+        if (strpbrk(args[i], "*?[") == NULL) {
+            nouveaux[nb++] = args[i];
+            continue;
+        }
+
+        glob_t g;
+        memset(&g, 0, sizeof(g));
+        if (glob(args[i], GLOB_NOCHECK, NULL, &g) == 0) {
+            for (size_t k = 0; k < g.gl_pathc && nb < MAX_ARGS - 1; k++) {
+                strncpy(stockage[nb], g.gl_pathv[k], MAX_PATH - 1);
+                stockage[nb][MAX_PATH - 1] = '\0';
+                nouveaux[nb] = stockage[nb];
+                nb++;
+            }
+            globfree(&g);
+        } else {
+            nouveaux[nb++] = args[i];
+        }
+    }
+
+    nouveaux[nb] = NULL;
+    for (int i = 0; i <= nb; i++)
+        args[i] = nouveaux[i];
+    *argc = nb;
+}
+
 /* Cherche et applique les redirections >, >> et < dans les arguments.
    Modifie args[] en supprimant les tokens de redirection. */
 void appliquer_redirections(char **args, int *argc) {
@@ -419,6 +556,23 @@ void appliquer_redirections(char **args, int *argc) {
                 args[j] = args[j + 2];
             *argc -= 2;
             args[*argc] = NULL;
+        } else if (strcmp(args[i], "2>&1") == 0) {
+            /* 2>&1 : stderr pointe sur la sortie standard courante */
+            if (dup2(STDOUT_FILENO, STDERR_FILENO) < 0)
+                perror("dup2");
+            for (int j = i; j < *argc - 1; j++)
+                args[j] = args[j + 1];
+            *argc -= 1;
+            args[*argc] = NULL;
+        } else if (strcmp(args[i], "2>") == 0 && i + 1 < *argc) {
+            int fd = open(args[i + 1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { perror("open"); exit(1); }
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+            for (int j = i; j < *argc - 2; j++)
+                args[j] = args[j + 2];
+            *argc -= 2;
+            args[*argc] = NULL;
         } else {
             i++;
         }
@@ -436,15 +590,20 @@ void executer_commande_simple(char **args, int argc, int background) {
         int a_redirection = 0;
         for (int i = 0; i < argc; i++) {
             if (strcmp(args[i], ">") == 0 || strcmp(args[i], ">>") == 0 ||
-                strcmp(args[i], "<") == 0) {
+                strcmp(args[i], "<") == 0 || strcmp(args[i], "2>") == 0 ||
+                strcmp(args[i], "2>&1") == 0) {
                 a_redirection = 1;
                 break;
             }
         }
 
         if (a_redirection) {
+            sigset_t ancien;
+
+            bloquer_sigchld(&ancien);
             pid_t pid = fork();
             if (pid == 0) {
+                restaurer_masque(&ancien);
                 signal(SIGINT, SIG_DFL);
                 appliquer_redirections(args, &argc);
                 executer_builtin(args, argc);
@@ -452,13 +611,17 @@ void executer_commande_simple(char **args, int argc, int background) {
             } else if (pid > 0) {
                 if (!background) {
                     int status;
-                    waitpid(pid, &status, 0);
-                    if (WIFEXITED(status))
-                        dernier_code = WEXITSTATUS(status);
+                    if (attendre_fils(pid, &status) == 0)
+                        dernier_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+                    restaurer_masque(&ancien);
                 } else {
+                    restaurer_masque(&ancien);
                     dernier_pid_bg = pid;
                     printf("[bg] %d\n", pid);
                 }
+            } else {
+                restaurer_masque(&ancien);
+                perror("fork");
             }
         } else {
             executer_builtin(args, argc);
@@ -471,9 +634,13 @@ void executer_commande_simple(char **args, int argc, int background) {
     traduire_alias(args);
 
     /* fork + exec pour les commandes externes */
+    sigset_t ancien;
+
+    bloquer_sigchld(&ancien);
     pid_t pid = fork();
     if (pid == 0) {
         /* Processus fils : rétablir SIGINT par défaut */
+        restaurer_masque(&ancien);
         signal(SIGINT, SIG_DFL);
         appliquer_redirections(args, &argc);
         execvp(args[0], args);
@@ -483,16 +650,16 @@ void executer_commande_simple(char **args, int argc, int background) {
     } else if (pid > 0) {
         if (!background) {
             int status;
-            waitpid(pid, &status, 0);
-            if (WIFEXITED(status))
-                dernier_code = WEXITSTATUS(status);
-            else
-                dernier_code = 1;
+            if (attendre_fils(pid, &status) == 0)
+                dernier_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+            restaurer_masque(&ancien);
         } else {
+            restaurer_masque(&ancien);
             dernier_pid_bg = pid;
             printf("[bg] %d\n", pid);
         }
     } else {
+        restaurer_masque(&ancien);
         perror("fork");
     }
 }
@@ -521,9 +688,14 @@ void executer_pipeline(char *ligne) {
     if (nb_cmd == 1) {
         /* Pas de pipe, commande simple */
         char *args[MAX_ARGS];
+        char normalisee[MAX_LINE];
         int background = 0;
 
-        int argc = decouper(commandes[0], args);
+        normaliser_redirections(commandes[0], normalisee, MAX_LINE);
+        int argc = decouper(normalisee, args);
+        if (argc == 0) return;
+
+        expandre_jokers(args, &argc);
         if (argc == 0) return;
 
         /* Vérifier & en fin de ligne */
@@ -540,12 +712,22 @@ void executer_pipeline(char *ligne) {
     /* Pipeline avec plusieurs commandes */
     int i;
     int prev_fd = -1;  /* fd de lecture du pipe précédent */
+    pid_t pids[MAX_ARGS];
+    sigset_t ancien;
+
+    /* SIGCHLD bloqué pendant tout le câblage et l'attente : le handler
+       ne peut pas voler le statut d'un maillon du pipeline. */
+    bloquer_sigchld(&ancien);
 
     for (i = 0; i < nb_cmd; i++) {
         char *args[MAX_ARGS];
-        int argc = decouper(commandes[i], args);
+        char normalisee[MAX_LINE];
+
+        normaliser_redirections(commandes[i], normalisee, MAX_LINE);
+        int argc = decouper(normalisee, args);
         if (argc == 0) continue;
 
+        expandre_jokers(args, &argc);
         traduire_alias(args);
 
         int pipefd[2];
@@ -558,7 +740,9 @@ void executer_pipeline(char *ligne) {
         }
 
         pid_t pid = fork();
+        pids[i] = pid;
         if (pid == 0) {
+            restaurer_masque(&ancien);
             signal(SIGINT, SIG_DFL);
 
             /* Connecter l'entrée au pipe précédent */
@@ -587,7 +771,8 @@ void executer_pipeline(char *ligne) {
             exit(127);
         } else if (pid < 0) {
             perror("fork");
-            return;
+            pids[i] = 0;
+            continue;
         }
 
         /* Parent : fermer les descripteurs */
@@ -599,31 +784,46 @@ void executer_pipeline(char *ligne) {
         }
     }
 
-    /* Attendre tous les processus du pipeline */
+    /* Attendre tous les processus du pipeline (dans l'ordre de création) */
     for (i = 0; i < nb_cmd; i++) {
         int status;
-        wait(&status);
-        if (i == nb_cmd - 1 && WIFEXITED(status))
-            dernier_code = WEXITSTATUS(status);
+
+        if (pids[i] <= 0)
+            continue;
+        if (attendre_fils(pids[i], &status) == 0) {
+            if (i == nb_cmd - 1)
+                dernier_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
     }
+    restaurer_masque(&ancien);
 }
 
 /* ===================== Gestion VAR=valeur ===================== */
 
 int est_affectation(char *ligne) {
-    char *egal = strchr(ligne, '=');
-    if (!egal || egal == ligne) return 0;
+    char *p = ligne;
+
+    /* Ignorer l'indentation : une affectation peut être indentée
+       dans un bloc while/for/if. */
+    while (*p == ' ' || *p == '\t') p++;
+
+    char *egal = strchr(p, '=');
+    if (!egal || egal == p) return 0;
     /* Vérifier que la partie avant = est un nom valide */
-    for (char *p = ligne; p < egal; p++) {
-        if (!isalnum(*p) && *p != '_') return 0;
+    for (char *q = p; q < egal; q++) {
+        if (!isalnum((unsigned char)*q) && *q != '_') return 0;
     }
     return 1;
 }
 
 void traiter_affectation(char *ligne) {
-    char *egal = strchr(ligne, '=');
+    char *p = ligne;
+
+    while (*p == ' ' || *p == '\t') p++;
+
+    char *egal = strchr(p, '=');
     *egal = '\0';
-    set_variable(ligne, egal + 1);
+    set_variable(p, egal + 1);
 }
 
 /* ===================== Fichier .ocshrc ===================== */
@@ -663,18 +863,26 @@ int evaluer_condition(char *condition) {
     expand_variables(condition, expanded, MAX_LINE);
 
     char copie[MAX_LINE];
+    char normalisee[MAX_LINE];
     strncpy(copie, expanded, MAX_LINE - 1);
     copie[MAX_LINE - 1] = '\0';
 
+    normaliser_redirections(copie, normalisee, MAX_LINE);
+
     char *args[MAX_ARGS];
-    int argc = decouper(copie, args);
+    int argc = decouper(normalisee, args);
     if (argc == 0) return 1;
+
+    expandre_jokers(args, &argc);
 
     traduire_alias(args);
 
+    sigset_t ancien;
+
+    bloquer_sigchld(&ancien);
     pid_t pid = fork();
     if (pid == 0) {
-        /* Rediriger la sortie vers /dev/null pour pas polluer */
+        restaurer_masque(&ancien);
         appliquer_redirections(args, &argc);
         if (est_builtin(args[0])) {
             executer_builtin(args, argc);
@@ -682,11 +890,16 @@ int evaluer_condition(char *condition) {
         }
         execvp(args[0], args);
         exit(127);
-    } else {
+    } else if (pid > 0) {
         int status;
-        waitpid(pid, &status, 0);
-        if (WIFEXITED(status))
+        int ok = attendre_fils(pid, &status);
+
+        restaurer_masque(&ancien);
+        if (ok == 0 && WIFEXITED(status))
             return WEXITSTATUS(status);
+        return 1;
+    } else {
+        restaurer_masque(&ancien);
         return 1;
     }
 }
@@ -879,7 +1092,8 @@ void executer_script_lignes(char **lignes, int debut, int fin) {
             continue;
         }
 
-        /* Commande normale */
+        /* Commande normale (l'indentation est gérée par est_affectation
+           et par le découpage en arguments) */
         executer_ligne(lignes[i]);
         i++;
     }
@@ -961,29 +1175,32 @@ void completer(char *ligne, int *pos) {
         }
     }
 
-    /* Chercher dans les fichiers du répertoire courant */
-    /* On utilise popen avec ls pour rester simple */
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "ls -1 2>/dev/null");
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return;
+    /* Chercher dans les fichiers du répertoire courant (opendir/readdir,
+       sans fork : plus simple et plus cohérent dans un shell) */
+    DIR *rep = opendir(".");
+    if (!rep) return;
 
-    char nom[256];
-    while (fgets(nom, sizeof(nom), fp)) {
-        nom[strcspn(nom, "\n")] = '\0';
-        if (strncmp(nom, prefixe, len_pref) == 0) {
-            char *reste = nom + len_pref;
-            int len_reste = strlen(reste);
-            for (int j = 0; j < len_reste; j++)
-                ligne[(*pos)++] = reste[j];
-            ligne[*pos] = '\0';
-            printf("%s", reste);
-            fflush(stdout);
-            pclose(fp);
-            return;
-        }
+    struct dirent *entree;
+    while ((entree = readdir(rep)) != NULL) {
+        /* Ne pas proposer les fichiers cachés sauf si demandés */
+        if (entree->d_name[0] == '.' && prefixe[0] != '.')
+            continue;
+        if (strncmp(entree->d_name, prefixe, len_pref) != 0)
+            continue;
+
+        char *reste = entree->d_name + len_pref;
+        int len_reste = strlen(reste);
+        if (*pos + len_reste >= MAX_LINE - 1)
+            continue;
+        for (int j = 0; j < len_reste; j++)
+            ligne[(*pos)++] = reste[j];
+        ligne[*pos] = '\0';
+        printf("%s", reste);
+        fflush(stdout);
+        closedir(rep);
+        return;
     }
-    pclose(fp);
+    closedir(rep);
 }
 
 /* ===================== Lecture interactive avec support TAB ===================== */
@@ -1009,6 +1226,13 @@ int lire_ligne(char *buf, int taille) {
     while (1) {
         char c;
         int n = read(STDIN_FILENO, &c, 1);
+        if (n < 0 && errno == EINTR) {
+            /* Ctrl+C : on jette la ligne en cours de frappe et on
+               rend la main au shell qui réaffiche un prompt propre. */
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
+            buf[0] = '\0';
+            return 1;
+        }
         if (n <= 0) {
             tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
             return 0;
@@ -1123,8 +1347,11 @@ int main(int argc_main, char *argv[]) {
             if (!lire_ligne(ligne, MAX_LINE))
                 break;
         } else {
-            if (fgets(ligne, MAX_LINE, stdin) == NULL)
+            if (fgets(ligne, MAX_LINE, stdin) == NULL) {
+                if (errno == EINTR)
+                    continue;  /* Ctrl+C : repartir sur un prompt propre */
                 break;
+            }
             ligne[strcspn(ligne, "\n")] = '\0';
         }
 
